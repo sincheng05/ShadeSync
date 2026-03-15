@@ -1,4 +1,4 @@
-package com.example.shadesync
+﻿package com.example.shadesync
 
 import android.Manifest
 import android.content.Context
@@ -10,7 +10,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import com.example.shadesync.feature.shadematch.ui.ShadeSyncApp
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -54,11 +53,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import com.example.shadesync.feature.shadematch.domain.RgbColor
+import com.example.shadesync.feature.shadematch.domain.RgbDistanceMatcher
 import com.example.shadesync.ui.theme.ShadeSyncTheme
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import kotlin.math.pow
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -215,7 +215,7 @@ private fun CameraPreviewWithAnalysis(onColorSampled: (Int) -> Unit) {
                 val cameraProvider = cameraProviderFuture.get()
 
                 val preview = Preview.Builder().build().also {
-                    it.surfaceProvider = previewView.surfaceProvider
+                    it.setSurfaceProvider(previewView.surfaceProvider)
                 }
 
                 val analysis = ImageAnalysis.Builder()
@@ -413,24 +413,18 @@ private fun MeasurementPanel(
 }
 
 private fun nearestShade(liveColor: Int, calibrations: Map<VitaShade, Int>): VitaShade? {
-    return calibrations.minByOrNull { (_, refColor) ->
-        colorDistance(liveColor, refColor)
-    }?.key
+    return RgbDistanceMatcher.nearest(
+        sample = liveColor.toRgbColor(),
+        references = calibrations.mapValues { (_, refColor) -> refColor.toRgbColor() }
+    )
 }
 
-private fun colorDistance(colorA: Int, colorB: Int): Double {
-    val rA = Color.red(colorA)
-    val gA = Color.green(colorA)
-    val bA = Color.blue(colorA)
-    val rB = Color.red(colorB)
-    val gB = Color.green(colorB)
-    val bB = Color.blue(colorB)
-
-    return (rA - rB).toDouble().pow(2.0) +
-        (gA - gB).toDouble().pow(2.0) +
-        (bA - bB).toDouble().pow(2.0)
+private fun Int.toRgbColor(): RgbColor {
+    return RgbColor(Color.red(this), Color.green(this), Color.blue(this))
 }
 
 private fun toHex(color: Int): String {
     return String.format(Locale.US, "#%02X%02X%02X", Color.red(color), Color.green(color), Color.blue(color))
 }
+
+

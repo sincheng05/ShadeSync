@@ -146,12 +146,11 @@
 - 真正能動的匹配只存在於 `MainActivity.kt` 的「用使用者自行校正資料做 RGB 最近鄰」流程。
 - 也就是說，目前 app 的可用匹配能力依賴使用者先手動校正，並不是內建標準牙色資料。
 
-### 5.4 測試與驗證幾乎未開始
+### 5.4 測試覆蓋仍偏薄，但已有核心邏輯保護
 
-- 單元測試只有範本 `2 + 2 = 4`。
-- Instrumented test 只有確認 package name。
-- 沒有針對相機分析、色彩轉換、匹配邏輯、資料保存做任何有效自動測試。
-
+- UI、CameraX 綁定、權限流程與影像分析器目前仍缺少自動化測試。
+- 但已補上純 Kotlin 的核心單元測試，覆蓋 `ColorMath` 與 RGB 最近鄰匹配邏輯。
+- 這代表未來即使 UI 重構，色彩轉換與基本匹配行為仍可透過測試快速驗證。
 ## 6. 檔案層級現況總表
 
 ### 6.1 根目錄與 Gradle
@@ -197,7 +196,7 @@
   - `buildFeatures.compose = true`
   - release 不混淆，`isMinifyEnabled = false`
   - 依賴包含 Compose Material3 與 CameraX。
-  - 重要現況：這裡目前只有 `android.application` 與 `kotlin.compose` plugin，沒有明確套用 `org.jetbrains.kotlin.android`。在尚未成功建置驗證前，這應視為建置風險點。
+  - 目前在 Android Studio JBR + Gradle wrapper 條件下，`testDebugUnitTest` 已可成功執行，表示這個快照下的設定可正常完成 Kotlin 編譯與 JVM 單元測試。
 - `app/proguard-rules.pro`
   - 幾乎是 Android Studio 範本，未客製化。
 
@@ -233,12 +232,12 @@
 
 - `app/src/main/java/com/example/shadesync/MainActivity.kt`
   - 目前最核心、最重要的檔案。
-  - 同時包含 activity 入口、app mode enum、Vita shade enum、calibration store、主 UI、camera preview、image analyzer、calibration panel、measurement panel、RGB 距離函式、色值 hex 格式化。
+  - 同時包含 activity 入口、app mode enum、Vita shade enum、calibration store、主 UI、camera preview、image analyzer、calibration panel、measurement panel、RGB -> `RgbDistanceMatcher` 轉接、色值 hex 格式化。
   - 這表示目前功能高度集中在單一檔案，還沒有完成分層或拆模組。
   - 相機綁定例外被 `catch (_: Exception) {}` 吃掉，沒有任何錯誤回報 UI。
   - 權限流程只有請求，不處理拒絕後的說明或設定導引。
 
-### 6.5 已存在但未接線的 Kotlin 檔
+### 6.5 feature/shadematch 相關 Kotlin 檔
 
 - `app/src/main/java/com/example/shadesync/feature/shadematch/data/Vita16Repository.kt`
   - Vita 16 placeholder repository。
@@ -246,6 +245,9 @@
   - 領域模型定義。
 - `app/src/main/java/com/example/shadesync/feature/shadematch/domain/ColorMath.kt`
   - 色彩數學工具。
+- `app/src/main/java/com/example/shadesync/feature/shadematch/domain/RgbDistanceMatcher.kt`
+  - 純 Kotlin 的 RGB 最近鄰匹配工具。
+  - 已被 `MainActivity.kt` 與單元測試使用。
 - `app/src/main/java/com/example/shadesync/feature/shadematch/presentation/ShadeMatchState.kt`
   - 狀態模型，未形成正式 presentation layer。
 - `app/src/main/java/com/example/shadesync/feature/shadematch/ui/Components.kt`
@@ -268,10 +270,13 @@
 ### 6.7 測試檔
 
 - `app/src/test/java/com/example/shadesync/ExampleUnitTest.kt`
-  - 只有預設加法測試。
+  - 仍保留預設加法測試。
+- `app/src/test/java/com/example/shadesync/feature/shadematch/domain/ColorMathTest.kt`
+  - 驗證白平衡夾值、黑白色 LAB 轉換與 Delta E 基本性質。
+- `app/src/test/java/com/example/shadesync/feature/shadematch/domain/RgbDistanceMatcherTest.kt`
+  - 驗證 RGB 平方距離與最近鄰匹配結果。
 - `app/src/androidTest/java/com/example/shadesync/ExampleInstrumentedTest.kt`
-  - 只有確認 package name 的預設測試。
-
+  - 仍是確認 package name 的預設測試。
 ## 7. 目前 UI / 功能層面的真實成熟度
 
 - 已有可展示的相機預覽與即時色值更新。
@@ -296,9 +301,10 @@
 - 不要把 `Vita16Repository` 的 placeholder 當成真實校正資料。
 - 不要把目前 app 敘述成診斷工具；從程式碼與文案看，它目前只適合做訊號/假說/比對原型。
 
-## 9. 本次靜態驗證狀態
+## 9. 本次驗證狀態
 
-- 本文件是根據 `android_app` 內現有 Gradle、Kotlin、XML 與資源檔逐一靜態閱讀整理而成。
-- 在此工作環境中，`.\gradlew.bat test` 無法執行，原因是目前沒有設定 `JAVA_HOME`，且 PATH 中找不到 `java`。
-- 因此目前沒有成功建置或跑測試的動態驗證結果。
-- 也因為沒有成功建置，`app/build.gradle.kts` 缺少 `org.jetbrains.kotlin.android` plugin 這件事，目前只能列為高風險建置疑點，尚未在此環境中完成最終驗證。
+- 本文件仍以 `android_app` 內現有 Gradle、Kotlin、XML 與資源檔逐一閱讀為基礎。
+- 另外已在此工作環境中找到 Android Studio JBR，並以專案內 `GRADLE_USER_HOME` 執行 `.\gradlew.bat testDebugUnitTest`。
+- 該命令已成功完成，代表目前快照下至少可通過 Kotlin 編譯與 JVM 單元測試。
+- 尚未在此回合執行的是裝置端 instrumented test 與實機相機流程驗證。
+

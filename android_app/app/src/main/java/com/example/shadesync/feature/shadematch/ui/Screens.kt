@@ -1,4 +1,4 @@
-package com.example.shadesync.feature.shadematch.ui
+﻿package com.example.shadesync.feature.shadematch.ui
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -14,6 +14,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -50,6 +51,7 @@ private enum class AppTab(val label: String, val shortLabel: String) {
     ABOUT("About", "A")
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ShadeSyncApp() {
     var currentTab by remember { mutableStateOf(AppTab.MATCH) }
@@ -379,3 +381,5 @@ private fun ShadeSyncAppPreview() {
         ShadeSyncApp()
     }
 }
+
+
