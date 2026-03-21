@@ -16,7 +16,10 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.animation.Crossfade
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -30,6 +33,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.DropdownMenu
@@ -47,18 +51,35 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size as CanvasSize
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import com.example.shadesync.camera.TargetFrameSpec
+import com.example.shadesync.camera.AdaptiveLightingPolicy
+import com.example.shadesync.camera.AdaptiveTorchController
+import com.example.shadesync.camera.LightingAssistMode
+import com.example.shadesync.camera.LightingAssistState
+import com.example.shadesync.camera.TargetSampling
+import com.example.shadesync.camera.TorchCapability
+import com.example.shadesync.camera.TorchLevel
+import com.example.shadesync.camera.ViewportSize
 import com.example.shadesync.feature.shadematch.domain.RgbColor
 import com.example.shadesync.feature.shadematch.domain.RgbDistanceMatcher
+import com.example.shadesync.ui.SplashScreen
 import com.example.shadesync.ui.theme.ShadeSyncTheme
-import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicReference
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -66,7 +87,20 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             ShadeSyncTheme {
-                ShadeSyncApp()
+                var splashFinished by rememberSaveable { mutableStateOf(false) }
+
+                Crossfade(
+                    targetState = splashFinished,
+                    label = "shade-sync-launch-transition"
+                ) { isReadyForMainContent ->
+                    if (isReadyForMainContent) {
+                        ShadeSyncApp()
+                    } else {
+                        SplashScreen(
+                            onSplashFinished = { splashFinished = true }
+                        )
+                    }
+                }
             }
         }
     }
@@ -116,6 +150,9 @@ private fun ShadeSyncApp() {
     var liveColor by remember { mutableIntStateOf(Color.WHITE) }
     var mode by remember { mutableStateOf(AppMode.CALIBRATION) }
     var selectedShade by remember { mutableStateOf(VitaShade.A1) }
+    var lightingMode by rememberSaveable { mutableStateOf(LightingAssistMode.AUTO) }
+    var autoTorchLevel by remember { mutableStateOf(TorchLevel.OFF) }
+    var torchCapability by remember { mutableStateOf(TorchCapability()) }
     var permissionGranted by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(
@@ -137,6 +174,30 @@ private fun ShadeSyncApp() {
         }
     }
 
+    val liveRgb = liveColor.toRgbColor()
+    val sceneLuminance = AdaptiveLightingPolicy.sceneLuminance(liveRgb)
+
+    LaunchedEffect(lightingMode, sceneLuminance) {
+        autoTorchLevel = if (lightingMode == LightingAssistMode.AUTO) {
+            AdaptiveLightingPolicy.recommendTorchLevel(
+                sceneLuminance = sceneLuminance,
+                previousTorchLevel = autoTorchLevel
+            )
+        } else {
+            TorchLevel.OFF
+        }
+    }
+
+    val requestedTorchLevel = if (lightingMode == LightingAssistMode.AUTO) {
+        autoTorchLevel
+    } else {
+        TorchLevel.OFF
+    }
+    val lightingAssistState = LightingAssistState(
+        sceneLuminance = sceneLuminance,
+        torchTarget = requestedTorchLevel
+    )
+
     Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
         Column(
             modifier = Modifier
@@ -147,7 +208,7 @@ private fun ShadeSyncApp() {
         ) {
             Text("ShadeSync", style = MaterialTheme.typography.headlineMedium)
             Text(
-                "Calibrate Vita 16 shades, then match patient tooth color in real time (250 ms updates).",
+                "Align one Vita tab or tooth inside the target frame. ShadeSync samples only that guided window every 250 ms.",
                 style = MaterialTheme.typography.bodyMedium
             )
 
@@ -156,10 +217,22 @@ private fun ShadeSyncApp() {
                     Text("Grant camera permission")
                 }
             } else {
-                CameraPreviewWithAnalysis(onColorSampled = { sampledColor ->
-                    liveColor = sampledColor
-                })
+                CameraPreviewWithAnalysis(
+                    onColorSampled = { sampledColor ->
+                        liveColor = sampledColor
+                    },
+                    requestedTorchLevel = requestedTorchLevel,
+                    onTorchCapabilityChanged = { torchCapability = it }
+                )
             }
+
+            LightingAssistCard(
+                lightingMode = lightingMode,
+                onLightingModeChanged = { lightingMode = it },
+                lightingAssistState = lightingAssistState,
+                torchCapability = torchCapability,
+                permissionGranted = permissionGranted
+            )
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = { mode = AppMode.CALIBRATION }) {
@@ -193,57 +266,346 @@ private fun ShadeSyncApp() {
 }
 
 @Composable
-private fun CameraPreviewWithAnalysis(onColorSampled: (Int) -> Unit) {
+private fun CameraPreviewWithAnalysis(
+    onColorSampled: (Int) -> Unit,
+    requestedTorchLevel: TorchLevel,
+    onTorchCapabilityChanged: (TorchCapability) -> Unit
+) {
+    val context = LocalContext.current
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     val executor: ExecutorService = remember { Executors.newSingleThreadExecutor() }
+    val targetFrameSpec = remember { TargetSampling.DefaultToothTarget }
+    val previewViewport = remember { AtomicReference(ViewportSize.Unspecified) }
+    val torchController = remember(context) { AdaptiveTorchController(context) }
+    var boundCamera by remember { mutableStateOf<androidx.camera.core.Camera?>(null) }
+    var torchCapability by remember { mutableStateOf(TorchCapability()) }
+    var lastRequestedTorchLevel by remember { mutableStateOf<TorchLevel?>(null) }
 
     DisposableEffect(Unit) {
-        onDispose { executor.shutdown() }
+        onDispose {
+            val camera = boundCamera
+            if (camera != null) {
+                torchController.requestTorchOff(camera, torchCapability)
+            }
+            onTorchCapabilityChanged(TorchCapability())
+            executor.shutdown()
+        }
     }
 
-    AndroidView(
+    LaunchedEffect(boundCamera, torchCapability, requestedTorchLevel) {
+        val camera = boundCamera ?: return@LaunchedEffect
+        if (!torchCapability.isReady || !torchCapability.hasFlashUnit) {
+            return@LaunchedEffect
+        }
+        if (lastRequestedTorchLevel == requestedTorchLevel) {
+            return@LaunchedEffect
+        }
+
+        torchController.requestTorchLevel(
+            camera = camera,
+            capability = torchCapability,
+            torchLevel = requestedTorchLevel
+        )
+        lastRequestedTorchLevel = requestedTorchLevel
+    }
+
+    Box(
         modifier = Modifier
             .fillMaxWidth()
-            .height(260.dp),
-        factory = { viewContext ->
-            val previewView = PreviewView(viewContext).apply {
-                scaleType = PreviewView.ScaleType.FILL_CENTER
+            .height(260.dp)
+            .clip(RoundedCornerShape(28.dp))
+            .border(
+                width = 1.dp,
+                color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f),
+                shape = RoundedCornerShape(28.dp)
+            )
+            .onSizeChanged { previewViewport.set(ViewportSize(it.width, it.height)) }
+    ) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { viewContext ->
+                val previewView = PreviewView(viewContext).apply {
+                    scaleType = PreviewView.ScaleType.FILL_CENTER
+                }
+
+                val cameraProviderFuture = ProcessCameraProvider.getInstance(viewContext)
+                cameraProviderFuture.addListener({
+                    val cameraProvider = cameraProviderFuture.get()
+
+                    val preview = Preview.Builder().build().also {
+                        it.setSurfaceProvider(previewView.surfaceProvider)
+                    }
+
+                    val analysis = ImageAnalysis.Builder()
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .setTargetResolution(Size(1280, 720))
+                        .build()
+
+                    analysis.setAnalyzer(
+                        executor,
+                        TargetColorAnalyzer(
+                            onColorSampled = onColorSampled,
+                            targetFrameSpec = targetFrameSpec,
+                            viewportSizeProvider = { previewViewport.get() }
+                        )
+                    )
+
+                    try {
+                        cameraProvider.unbindAll()
+                        val camera = cameraProvider.bindToLifecycle(
+                            lifecycleOwner,
+                            CameraSelector.DEFAULT_BACK_CAMERA,
+                            preview,
+                            analysis
+                        )
+                        val capability = torchController.inspect(camera)
+                        boundCamera = camera
+                        torchCapability = capability
+                        lastRequestedTorchLevel = null
+                        onTorchCapabilityChanged(capability)
+                    } catch (_: Exception) {
+                    }
+                }, ContextCompat.getMainExecutor(viewContext))
+
+                previewView
+            }
+        )
+        ToothTargetOverlay(
+            modifier = Modifier.fillMaxSize(),
+            targetFrameSpec = targetFrameSpec
+        )
+    }
+}
+
+@Composable
+private fun LightingAssistCard(
+    lightingMode: LightingAssistMode,
+    onLightingModeChanged: (LightingAssistMode) -> Unit,
+    lightingAssistState: LightingAssistState,
+    torchCapability: TorchCapability,
+    permissionGranted: Boolean
+) {
+    val requestedStrength = if (torchCapability.supportsStrengthControl) {
+        AdaptiveLightingPolicy.strengthFor(
+            torchLevel = lightingAssistState.torchTarget,
+            maxStrengthLevel = torchCapability.maxStrengthLevel
+        )
+    } else {
+        null
+    }
+
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text("Adaptive illumination", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "ShadeSync can use the rear torch to stabilize sampling when the guided target frame is too dark.",
+                style = MaterialTheme.typography.bodySmall
+            )
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (lightingMode == LightingAssistMode.OFF) {
+                    Button(onClick = { onLightingModeChanged(LightingAssistMode.OFF) }) {
+                        Text("Lighting off")
+                    }
+                } else {
+                    OutlinedButton(onClick = { onLightingModeChanged(LightingAssistMode.OFF) }) {
+                        Text("Lighting off")
+                    }
+                }
+
+                if (lightingMode == LightingAssistMode.AUTO) {
+                    Button(onClick = { onLightingModeChanged(LightingAssistMode.AUTO) }) {
+                        Text("Auto lighting")
+                    }
+                } else {
+                    OutlinedButton(onClick = { onLightingModeChanged(LightingAssistMode.AUTO) }) {
+                        Text("Auto lighting")
+                    }
+                }
             }
 
-            val cameraProviderFuture = ProcessCameraProvider.getInstance(viewContext)
-            cameraProviderFuture.addListener({
-                val cameraProvider = cameraProviderFuture.get()
+            val luminanceStatus = if (permissionGranted) {
+                "Scene luminance in target frame: ${lightingAssistState.scenePercent}% (${lightingAssistState.sceneDescription()})"
+            } else {
+                "Scene luminance in target frame will appear after camera permission is granted."
+            }
 
-                val preview = Preview.Builder().build().also {
-                    it.setSurfaceProvider(previewView.surfaceProvider)
+            Text(luminanceStatus, style = MaterialTheme.typography.bodySmall)
+
+            val lightingStatus = when {
+                !permissionGranted -> {
+                    "Camera permission is required before the rear torch can be inspected."
                 }
 
-                val analysis = ImageAnalysis.Builder()
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .setTargetResolution(Size(1280, 720))
-                    .build()
-
-                analysis.setAnalyzer(executor, CenterColorAnalyzer(onColorSampled))
-
-                try {
-                    cameraProvider.unbindAll()
-                    cameraProvider.bindToLifecycle(
-                        lifecycleOwner,
-                        CameraSelector.DEFAULT_BACK_CAMERA,
-                        preview,
-                        analysis
-                    )
-                } catch (_: Exception) {
+                !torchCapability.isReady -> {
+                    "Preparing rear camera illumination controls..."
                 }
-            }, ContextCompat.getMainExecutor(viewContext))
 
-            previewView
+                !torchCapability.hasFlashUnit -> {
+                    "This device does not expose a rear flash unit. Brightness guidance remains available."
+                }
+
+                lightingMode == LightingAssistMode.OFF -> {
+                    "Torch target: Off."
+                }
+
+                requestedStrength != null -> {
+                    "Torch target: ${lightingAssistState.torchTarget.displayName} ($requestedStrength/${torchCapability.maxStrengthLevel})."
+                }
+
+                lightingAssistState.torchTarget == TorchLevel.OFF -> {
+                    "Torch target: Off."
+                }
+
+                else -> {
+                    "Torch target: On. This device falls back to binary torch control."
+                }
+            }
+
+            Text(lightingStatus, style = MaterialTheme.typography.bodySmall)
         }
+    }
+}
+
+@Composable
+private fun BoxScope.ToothTargetOverlay(
+    modifier: Modifier = Modifier,
+    targetFrameSpec: TargetFrameSpec
+) {
+    androidx.compose.foundation.Canvas(
+        modifier = modifier
+    ) {
+        val frameWidth = size.width * targetFrameSpec.widthFraction
+        val frameHeight = size.height * targetFrameSpec.heightFraction
+        val frameLeft = size.width * targetFrameSpec.centerXFraction - frameWidth / 2f
+        val frameTop = size.height * targetFrameSpec.centerYFraction - frameHeight / 2f
+        val cornerRadius = CornerRadius(x = frameWidth * 0.28f, y = frameWidth * 0.28f)
+        val shadowColor = androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.24f)
+        val strokeColor = androidx.compose.ui.graphics.Color(0xFFFFD18A)
+        val guideColor = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.92f)
+        val glowStroke = 10.dp.toPx()
+        val outlineStroke = 3.dp.toPx()
+        val guideStroke = 4.dp.toPx()
+        val cornerLength = minOf(frameWidth, frameHeight) * 0.24f
+        val frameRight = frameLeft + frameWidth
+        val frameBottom = frameTop + frameHeight
+
+        drawRect(
+            color = shadowColor,
+            topLeft = Offset.Zero,
+            size = CanvasSize(width = size.width, height = frameTop.coerceAtLeast(0f))
+        )
+        drawRect(
+            color = shadowColor,
+            topLeft = Offset(0f, frameTop),
+            size = CanvasSize(width = frameLeft.coerceAtLeast(0f), height = frameHeight)
+        )
+        drawRect(
+            color = shadowColor,
+            topLeft = Offset(frameRight, frameTop),
+            size = CanvasSize(
+                width = (size.width - frameRight).coerceAtLeast(0f),
+                height = frameHeight
+            )
+        )
+        drawRect(
+            color = shadowColor,
+            topLeft = Offset(0f, frameBottom),
+            size = CanvasSize(
+                width = size.width,
+                height = (size.height - frameBottom).coerceAtLeast(0f)
+            )
+        )
+
+        drawRoundRect(
+            color = strokeColor.copy(alpha = 0.28f),
+            topLeft = Offset(frameLeft, frameTop),
+            size = CanvasSize(frameWidth, frameHeight),
+            cornerRadius = cornerRadius,
+            style = Stroke(width = glowStroke)
+        )
+        drawRoundRect(
+            color = strokeColor,
+            topLeft = Offset(frameLeft, frameTop),
+            size = CanvasSize(frameWidth, frameHeight),
+            cornerRadius = cornerRadius,
+            style = Stroke(width = outlineStroke)
+        )
+
+        drawCornerGuide(
+            start = Offset(frameLeft, frameTop + cornerLength),
+            end = Offset(frameLeft, frameTop),
+            color = guideColor,
+            strokeWidth = guideStroke
+        )
+        drawCornerGuide(
+            start = Offset(frameLeft, frameTop),
+            end = Offset(frameLeft + cornerLength, frameTop),
+            color = guideColor,
+            strokeWidth = guideStroke
+        )
+        drawCornerGuide(
+            start = Offset(frameRight - cornerLength, frameTop),
+            end = Offset(frameRight, frameTop),
+            color = guideColor,
+            strokeWidth = guideStroke
+        )
+        drawCornerGuide(
+            start = Offset(frameRight, frameTop),
+            end = Offset(frameRight, frameTop + cornerLength),
+            color = guideColor,
+            strokeWidth = guideStroke
+        )
+        drawCornerGuide(
+            start = Offset(frameLeft, frameBottom - cornerLength),
+            end = Offset(frameLeft, frameBottom),
+            color = guideColor,
+            strokeWidth = guideStroke
+        )
+        drawCornerGuide(
+            start = Offset(frameLeft, frameBottom),
+            end = Offset(frameLeft + cornerLength, frameBottom),
+            color = guideColor,
+            strokeWidth = guideStroke
+        )
+        drawCornerGuide(
+            start = Offset(frameRight - cornerLength, frameBottom),
+            end = Offset(frameRight, frameBottom),
+            color = guideColor,
+            strokeWidth = guideStroke
+        )
+        drawCornerGuide(
+            start = Offset(frameRight, frameBottom - cornerLength),
+            end = Offset(frameRight, frameBottom),
+            color = guideColor,
+            strokeWidth = guideStroke
+        )
+    }
+}
+
+private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawCornerGuide(
+    start: Offset,
+    end: Offset,
+    color: androidx.compose.ui.graphics.Color,
+    strokeWidth: Float
+) {
+    drawLine(
+        color = color,
+        start = start,
+        end = end,
+        strokeWidth = strokeWidth
     )
 }
 
-private class CenterColorAnalyzer(
-    private val onColorSampled: (Int) -> Unit
+private class TargetColorAnalyzer(
+    private val onColorSampled: (Int) -> Unit,
+    private val targetFrameSpec: TargetFrameSpec,
+    private val viewportSizeProvider: () -> ViewportSize
 ) : ImageAnalysis.Analyzer {
     private var lastTimestamp = 0L
 
@@ -253,7 +615,7 @@ private class CenterColorAnalyzer(
             image.close()
             return
         }
-
+ 
         val yPlane = image.planes[0].buffer
         val uPlane = image.planes[1].buffer
         val vPlane = image.planes[2].buffer
@@ -266,20 +628,23 @@ private class CenterColorAnalyzer(
         val uPixelStride = image.planes[1].pixelStride
         val vPixelStride = image.planes[2].pixelStride
 
+        val roi = TargetSampling.imageRoiForTarget(
+            imageWidth = width,
+            imageHeight = height,
+            viewportSize = viewportSizeProvider(),
+            targetFrameSpec = targetFrameSpec
+        )
+
         var rSum = 0L
         var gSum = 0L
         var bSum = 0L
         var count = 0L
+        val sampleStep = 4
 
-        val startX = width / 3
-        val endX = width * 2 / 3
-        val startY = height / 3
-        val endY = height * 2 / 3
-
-        var y = startY
-        while (y < endY) {
-            var x = startX
-            while (x < endX) {
+        var y = roi.top
+        while (y < roi.bottom) {
+            var x = roi.left
+            while (x < roi.right) {
                 val yIndex = y * yRowStride + x
                 val uvX = x / 2
                 val uvY = y / 2
@@ -299,9 +664,9 @@ private class CenterColorAnalyzer(
                 bSum += b
                 count++
 
-                x += 8
+                x += sampleStep
             }
-            y += 8
+            y += sampleStep
         }
 
         if (count > 0) {
@@ -316,6 +681,8 @@ private class CenterColorAnalyzer(
 
 @Composable
 private fun LiveColorCard(liveColor: Int) {
+    val scientificReadout = liveColor.toRgbColor().toScientificColorReadout()
+
     Card(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
@@ -329,7 +696,17 @@ private fun LiveColorCard(liveColor: Int) {
                     .background(androidx.compose.ui.graphics.Color(liveColor))
             )
             Spacer(Modifier.width(12.dp))
-            Text("Live sampled color: ${toHex(liveColor)}")
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text("Live sampled color: ${scientificReadout.hex}")
+                Text(
+                    text = scientificReadout.rgbDisplay(),
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Text(
+                    text = scientificReadout.labDisplay(),
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
         }
     }
 }
@@ -374,7 +751,7 @@ private fun CalibrationPanel(
                 items(VitaShade.entries) { shade ->
                     val savedColor = calibrations[shade]
                     Text(
-                        if (savedColor != null) "${shade.code}: ${toHex(savedColor)}"
+                        if (savedColor != null) "${shade.code}: ${savedColor.toRgbColor().toHexString()}"
                         else "${shade.code}: not calibrated"
                     )
                 }
@@ -402,7 +779,7 @@ private fun MeasurementPanel(
                 val bestMatch = nearestShade(liveColor, calibrations)
                 if (bestMatch != null) {
                     Text("Best matched shade: ${bestMatch.code}")
-                    Text("Current color: ${toHex(liveColor)}")
+                    Text("Current color: ${liveColor.toRgbColor().toHexString()}")
                     Text("Compared against ${calibrations.size} calibrated shades.")
                 } else {
                     Text("Unable to match shade.")
@@ -421,10 +798,6 @@ private fun nearestShade(liveColor: Int, calibrations: Map<VitaShade, Int>): Vit
 
 private fun Int.toRgbColor(): RgbColor {
     return RgbColor(Color.red(this), Color.green(this), Color.blue(this))
-}
-
-private fun toHex(color: Int): String {
-    return String.format(Locale.US, "#%02X%02X%02X", Color.red(color), Color.green(color), Color.blue(color))
 }
 
 
