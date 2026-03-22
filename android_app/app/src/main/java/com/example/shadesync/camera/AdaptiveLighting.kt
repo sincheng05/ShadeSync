@@ -11,7 +11,8 @@ import kotlin.math.roundToInt
 
 internal enum class LightingAssistMode {
     OFF,
-    AUTO
+    AUTO,
+    MANUAL
 }
 
 internal enum class TorchLevel(val displayName: String) {
@@ -23,7 +24,7 @@ internal enum class TorchLevel(val displayName: String) {
 
 internal data class LightingAssistState(
     val sceneLuminance: Double,
-    val torchTarget: TorchLevel
+    val autoTorchTarget: TorchLevel
 ) {
     val scenePercent: Int
         get() = (sceneLuminance * 100).roundToInt()
@@ -37,6 +38,12 @@ internal data class LightingAssistState(
         }
     }
 }
+
+internal data class TorchRequest(
+    val mode: LightingAssistMode,
+    val autoTorchTarget: TorchLevel = TorchLevel.OFF,
+    val manualBrightnessPercent: Int = 0
+)
 
 internal data class TorchCapability(
     val isReady: Boolean = false,
@@ -111,6 +118,21 @@ internal object AdaptiveLightingPolicy {
             TorchLevel.HIGH -> safeMaxStrength
         }
     }
+
+    fun manualStrengthForPercent(
+        brightnessPercent: Int,
+        maxStrengthLevel: Int
+    ): Int? {
+        val normalizedPercent = brightnessPercent.coerceIn(0, 100)
+        if (normalizedPercent == 0) {
+            return null
+        }
+
+        val safeMaxStrength = maxStrengthLevel.coerceAtLeast(1)
+        return ((normalizedPercent / 100.0) * safeMaxStrength)
+            .roundToInt()
+            .coerceAtLeast(1)
+    }
 }
 
 internal class AdaptiveTorchController(context: Context) {
@@ -148,15 +170,43 @@ internal class AdaptiveTorchController(context: Context) {
         )
     }
 
-    fun requestTorchLevel(
+    fun requestTorch(
         camera: Camera,
         capability: TorchCapability,
-        torchLevel: TorchLevel
+        request: TorchRequest
     ) {
         if (!capability.hasFlashUnit) {
             return
         }
 
+        when (request.mode) {
+            LightingAssistMode.OFF -> {
+                requestTorchOff(camera, capability)
+            }
+
+            LightingAssistMode.AUTO -> {
+                requestAutoTorch(
+                    camera = camera,
+                    capability = capability,
+                    torchLevel = request.autoTorchTarget
+                )
+            }
+
+            LightingAssistMode.MANUAL -> {
+                requestManualTorch(
+                    camera = camera,
+                    capability = capability,
+                    manualBrightnessPercent = request.manualBrightnessPercent
+                )
+            }
+        }
+    }
+
+    private fun requestAutoTorch(
+        camera: Camera,
+        capability: TorchCapability,
+        torchLevel: TorchLevel
+    ) {
         if (torchLevel == TorchLevel.OFF) {
             requestTorchOff(camera, capability)
             return
@@ -164,6 +214,35 @@ internal class AdaptiveTorchController(context: Context) {
 
         if (capability.supportsStrengthControl && capability.cameraId != null) {
             val strength = AdaptiveLightingPolicy.strengthFor(torchLevel, capability.maxStrengthLevel)
+            if (strength != null) {
+                runCatching {
+                    cameraManager.turnOnTorchWithStrengthLevel(capability.cameraId, strength)
+                }.getOrElse {
+                    camera.cameraControl.enableTorch(true)
+                }
+                return
+            }
+        }
+
+        camera.cameraControl.enableTorch(true)
+    }
+
+    private fun requestManualTorch(
+        camera: Camera,
+        capability: TorchCapability,
+        manualBrightnessPercent: Int
+    ) {
+        val normalizedPercent = manualBrightnessPercent.coerceIn(0, 100)
+        if (normalizedPercent == 0) {
+            requestTorchOff(camera, capability)
+            return
+        }
+
+        if (capability.supportsStrengthControl && capability.cameraId != null) {
+            val strength = AdaptiveLightingPolicy.manualStrengthForPercent(
+                brightnessPercent = normalizedPercent,
+                maxStrengthLevel = capability.maxStrengthLevel
+            )
             if (strength != null) {
                 runCatching {
                     cameraManager.turnOnTorchWithStrengthLevel(capability.cameraId, strength)

@@ -1,4 +1,4 @@
-﻿package com.example.shadesync
+package com.example.shadesync
 
 import android.Manifest
 import android.content.Context
@@ -13,15 +13,17 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageCapture
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.Crossfade
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -38,10 +40,16 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -50,8 +58,9 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -61,25 +70,37 @@ import androidx.compose.ui.geometry.Size as CanvasSize
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import com.example.shadesync.camera.TargetFrameSpec
 import com.example.shadesync.camera.AdaptiveLightingPolicy
 import com.example.shadesync.camera.AdaptiveTorchController
 import com.example.shadesync.camera.LightingAssistMode
 import com.example.shadesync.camera.LightingAssistState
+import com.example.shadesync.camera.TargetFrameSpec
+import com.example.shadesync.camera.TargetImageCaptureController
 import com.example.shadesync.camera.TargetSampling
 import com.example.shadesync.camera.TorchCapability
+import com.example.shadesync.camera.TorchRequest
 import com.example.shadesync.camera.TorchLevel
 import com.example.shadesync.camera.ViewportSize
+import com.example.shadesync.cloud.GoogleCloudManager
+import com.example.shadesync.cloud.MeasurementUploadRecord
 import com.example.shadesync.feature.shadematch.domain.RgbColor
 import com.example.shadesync.feature.shadematch.domain.RgbDistanceMatcher
 import com.example.shadesync.ui.SplashScreen
 import com.example.shadesync.ui.theme.ShadeSyncTheme
+import com.google.android.gms.auth.api.signin.GoogleSignIn
+import com.google.android.gms.auth.api.signin.GoogleSignInAccount
+import com.google.android.gms.auth.api.signin.GoogleSignInOptions
+import com.google.android.gms.common.api.ApiException
+import com.google.android.gms.common.api.Scope
+import com.google.api.services.drive.DriveScopes
+import com.google.api.services.sheets.v4.SheetsScopes
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -127,6 +148,11 @@ private enum class VitaShade(val code: String) {
     D4("D4")
 }
 
+private data class ShadeMatchResult(
+    val shade: VitaShade,
+    val distanceSquared: Int
+)
+
 private class CalibrationStore(context: Context) {
     private val prefs: SharedPreferences =
         context.getSharedPreferences("shade_calibration", Context.MODE_PRIVATE)
@@ -142,17 +168,31 @@ private class CalibrationStore(context: Context) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ShadeSyncApp() {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
     val calibrationStore = remember { CalibrationStore(context) }
+    val captureController = remember { TargetImageCaptureController() }
+    val googleSignInClient = remember(context) { buildGoogleSignInClient(context) }
     val calibrations = remember { mutableStateMapOf<VitaShade, Int>() }
     var liveColor by remember { mutableIntStateOf(Color.WHITE) }
     var mode by remember { mutableStateOf(AppMode.CALIBRATION) }
     var selectedShade by remember { mutableStateOf(VitaShade.A1) }
     var lightingMode by rememberSaveable { mutableStateOf(LightingAssistMode.AUTO) }
     var autoTorchLevel by remember { mutableStateOf(TorchLevel.OFF) }
+    var manualLightingPercent by rememberSaveable { mutableIntStateOf(60) }
     var torchCapability by remember { mutableStateOf(TorchCapability()) }
+    var captureReady by remember { mutableStateOf(false) }
+    var isUploading by remember { mutableStateOf(false) }
+    var lastUploadSummary by remember { mutableStateOf<String?>(null) }
+    var googleAccount by remember {
+        mutableStateOf(
+            GoogleSignIn.getLastSignedInAccount(context)?.takeIf { hasRequiredCloudScopes(it) }
+        )
+    }
     var permissionGranted by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(
@@ -160,6 +200,43 @@ private fun ShadeSyncApp() {
                 Manifest.permission.CAMERA
             ) == android.content.pm.PackageManager.PERMISSION_GRANTED
         )
+    }
+
+    DisposableEffect(captureController) {
+        onDispose {
+            captureController.shutdown()
+        }
+    }
+
+    val signInLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        runCatching {
+            GoogleSignIn.getSignedInAccountFromIntent(result.data)
+                .getResult(ApiException::class.java)
+        }.onSuccess { account ->
+            if (hasRequiredCloudScopes(account)) {
+                googleAccount = account
+                scope.launch {
+                    snackbarHostState.showSnackbar("Google Drive and Sheets are connected.")
+                }
+            } else {
+                googleAccount = null
+                scope.launch {
+                    snackbarHostState.showSnackbar(
+                        "Google sign-in completed, but Drive and Sheets permissions were not granted."
+                    )
+                }
+            }
+        }.onFailure { throwable ->
+            scope.launch {
+                snackbarHostState.showSnackbar(
+                    throwable.asUserMessage(
+                        fallback = "Google sign-in failed. Please try again."
+                    )
+                )
+            }
+        }
     }
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -178,27 +255,58 @@ private fun ShadeSyncApp() {
     val sceneLuminance = AdaptiveLightingPolicy.sceneLuminance(liveRgb)
 
     LaunchedEffect(lightingMode, sceneLuminance) {
-        autoTorchLevel = if (lightingMode == LightingAssistMode.AUTO) {
-            AdaptiveLightingPolicy.recommendTorchLevel(
+        if (lightingMode == LightingAssistMode.AUTO) {
+            autoTorchLevel = AdaptiveLightingPolicy.recommendTorchLevel(
                 sceneLuminance = sceneLuminance,
                 previousTorchLevel = autoTorchLevel
             )
-        } else {
-            TorchLevel.OFF
         }
     }
 
-    val requestedTorchLevel = if (lightingMode == LightingAssistMode.AUTO) {
-        autoTorchLevel
-    } else {
-        TorchLevel.OFF
-    }
     val lightingAssistState = LightingAssistState(
         sceneLuminance = sceneLuminance,
-        torchTarget = requestedTorchLevel
+        autoTorchTarget = autoTorchLevel
     )
+    val torchRequest = when (lightingMode) {
+        LightingAssistMode.OFF -> {
+            TorchRequest(mode = LightingAssistMode.OFF)
+        }
 
-    Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
+        LightingAssistMode.AUTO -> {
+            TorchRequest(
+                mode = LightingAssistMode.AUTO,
+                autoTorchTarget = autoTorchLevel
+            )
+        }
+
+        LightingAssistMode.MANUAL -> {
+            TorchRequest(
+                mode = LightingAssistMode.MANUAL,
+                manualBrightnessPercent = manualLightingPercent
+            )
+        }
+    }
+
+    Scaffold(
+        modifier = Modifier.fillMaxSize(),
+        topBar = {
+            TopAppBar(
+                title = { Text("ShadeSync") },
+                actions = {
+                    CloudAccountAction(
+                        account = googleAccount,
+                        isUploading = isUploading,
+                        onSignInClick = {
+                            signInLauncher.launch(googleSignInClient.signInIntent)
+                        }
+                    )
+                }
+            )
+        },
+        snackbarHost = {
+            SnackbarHost(hostState = snackbarHostState)
+        }
+    ) { innerPadding ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -206,7 +314,6 @@ private fun ShadeSyncApp() {
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text("ShadeSync", style = MaterialTheme.typography.headlineMedium)
             Text(
                 "Align one Vita tab or tooth inside the target frame. ShadeSync samples only that guided window every 250 ms.",
                 style = MaterialTheme.typography.bodyMedium
@@ -221,8 +328,10 @@ private fun ShadeSyncApp() {
                     onColorSampled = { sampledColor ->
                         liveColor = sampledColor
                     },
-                    requestedTorchLevel = requestedTorchLevel,
-                    onTorchCapabilityChanged = { torchCapability = it }
+                    torchRequest = torchRequest,
+                    onTorchCapabilityChanged = { torchCapability = it },
+                    captureController = captureController,
+                    onCaptureReadyChanged = { captureReady = it }
                 )
             }
 
@@ -230,6 +339,8 @@ private fun ShadeSyncApp() {
                 lightingMode = lightingMode,
                 onLightingModeChanged = { lightingMode = it },
                 lightingAssistState = lightingAssistState,
+                manualLightingPercent = manualLightingPercent,
+                onManualLightingPercentChanged = { manualLightingPercent = it },
                 torchCapability = torchCapability,
                 permissionGranted = permissionGranted
             )
@@ -244,6 +355,67 @@ private fun ShadeSyncApp() {
             }
 
             LiveColorCard(liveColor)
+
+            if (mode == AppMode.MEASUREMENT) {
+                CloudCaptureCard(
+                    account = googleAccount,
+                    permissionGranted = permissionGranted,
+                    captureReady = captureReady,
+                    isUploading = isUploading,
+                    lastUploadSummary = lastUploadSummary,
+                    onUploadClick = uploadClick@{
+                        val account = googleAccount
+                        if (account == null) {
+                            scope.launch {
+                                snackbarHostState.showSnackbar("Sign in with Google before uploading.")
+                            }
+                            return@uploadClick
+                        }
+
+                        scope.launch {
+                            isUploading = true
+                            try {
+                                val captured = captureController.captureTargetJpeg()
+                                val match = nearestShadeMatch(
+                                    sample = captured.sampledColor,
+                                    calibrations = calibrations
+                                )
+                                val record = MeasurementUploadRecord.fromCapturedSample(
+                                    capturedAtUnixMs = captured.capturedAtUnixMs,
+                                    rgb = captured.sampledColor,
+                                    imageWidthPx = captured.widthPx,
+                                    imageHeightPx = captured.heightPx,
+                                    bestMatchShadeCode = match?.shade?.code,
+                                    bestMatchRgbDistanceSquared = match?.distanceSquared
+                                )
+                                val uploadResult = GoogleCloudManager(
+                                    context = context.applicationContext,
+                                    account = account
+                                ).uploadMeasurement(
+                                    record = record,
+                                    imageBytes = captured.jpegBytes
+                                )
+
+                                lastUploadSummary = buildUploadSummary(
+                                    record = record,
+                                    driveWebLink = uploadResult.driveWebLink
+                                )
+                                snackbarHostState.showSnackbar(
+                                    "Uploaded target crop to Google Drive and Sheets."
+                                )
+                            } catch (throwable: Throwable) {
+                                snackbarHostState.showSnackbar(
+                                    throwable.asUserMessage(
+                                        fallback = "Upload failed. Check Google sign-in and network access."
+                                    )
+                                )
+                            } finally {
+                                isUploading = false
+                            }
+                        }
+                    }
+                )
+            }
 
             when (mode) {
                 AppMode.CALIBRATION -> CalibrationPanel(
@@ -266,47 +438,141 @@ private fun ShadeSyncApp() {
 }
 
 @Composable
+private fun CloudAccountAction(
+    account: GoogleSignInAccount?,
+    isUploading: Boolean,
+    onSignInClick: () -> Unit
+) {
+    if (account == null) {
+        TextButton(
+            enabled = !isUploading,
+            onClick = onSignInClick
+        ) {
+            Text("Google Sign In")
+        }
+    } else {
+        Column(
+            modifier = Modifier.padding(end = 12.dp),
+            horizontalAlignment = Alignment.End
+        ) {
+            Text(
+                text = "Cloud connected",
+                style = MaterialTheme.typography.labelSmall
+            )
+            Text(
+                text = account.email ?: account.displayName ?: "Google account",
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.labelSmall
+            )
+        }
+    }
+}
+
+@Composable
+private fun CloudCaptureCard(
+    account: GoogleSignInAccount?,
+    permissionGranted: Boolean,
+    captureReady: Boolean,
+    isUploading: Boolean,
+    lastUploadSummary: String?,
+    onUploadClick: () -> Unit
+) {
+    val statusMessage = when {
+        account == null -> {
+            "Use the Google sign-in button above to store cropped tooth captures in your own Drive."
+        }
+
+        !permissionGranted -> {
+            "Camera permission is required before ShadeSync can capture and upload a target photo."
+        }
+
+        !captureReady -> {
+            "Preparing CameraX still capture for the target frame..."
+        }
+
+        else -> {
+            "ShadeSync will upload the target crop plus Unix time, RGB, LAB, best-match metadata, and the Drive photo link."
+        }
+    }
+
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text("Cloud capture", style = MaterialTheme.typography.titleMedium)
+            Text(statusMessage, style = MaterialTheme.typography.bodySmall)
+
+            if (account != null) {
+                Text(
+                    text = "Signed in as ${account.email ?: account.displayName ?: "Google account"}",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            Button(
+                onClick = onUploadClick,
+                enabled = account != null && permissionGranted && captureReady && !isUploading
+            ) {
+                Text(if (isUploading) "Uploading..." else "Capture target and upload")
+            }
+
+            if (lastUploadSummary != null) {
+                Text(lastUploadSummary, style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+}
+
+@Suppress("DEPRECATION")
+@Composable
 private fun CameraPreviewWithAnalysis(
     onColorSampled: (Int) -> Unit,
-    requestedTorchLevel: TorchLevel,
-    onTorchCapabilityChanged: (TorchCapability) -> Unit
+    torchRequest: TorchRequest,
+    onTorchCapabilityChanged: (TorchCapability) -> Unit,
+    captureController: TargetImageCaptureController,
+    onCaptureReadyChanged: (Boolean) -> Unit
 ) {
     val context = LocalContext.current
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     val executor: ExecutorService = remember { Executors.newSingleThreadExecutor() }
     val targetFrameSpec = remember { TargetSampling.DefaultToothTarget }
-    val previewViewport = remember { AtomicReference(ViewportSize.Unspecified) }
     val torchController = remember(context) { AdaptiveTorchController(context) }
     var boundCamera by remember { mutableStateOf<androidx.camera.core.Camera?>(null) }
     var torchCapability by remember { mutableStateOf(TorchCapability()) }
-    var lastRequestedTorchLevel by remember { mutableStateOf<TorchLevel?>(null) }
+    var lastTorchRequest by remember { mutableStateOf<TorchRequest?>(null) }
 
-    DisposableEffect(Unit) {
+    DisposableEffect(captureController) {
         onDispose {
             val camera = boundCamera
             if (camera != null) {
                 torchController.requestTorchOff(camera, torchCapability)
             }
+            captureController.clearBinding()
+            onCaptureReadyChanged(false)
             onTorchCapabilityChanged(TorchCapability())
             executor.shutdown()
         }
     }
 
-    LaunchedEffect(boundCamera, torchCapability, requestedTorchLevel) {
+    LaunchedEffect(boundCamera, torchCapability, torchRequest) {
         val camera = boundCamera ?: return@LaunchedEffect
         if (!torchCapability.isReady || !torchCapability.hasFlashUnit) {
             return@LaunchedEffect
         }
-        if (lastRequestedTorchLevel == requestedTorchLevel) {
+        if (lastTorchRequest == torchRequest) {
             return@LaunchedEffect
         }
 
-        torchController.requestTorchLevel(
+        torchController.requestTorch(
             camera = camera,
             capability = torchCapability,
-            torchLevel = requestedTorchLevel
+            request = torchRequest
         )
-        lastRequestedTorchLevel = requestedTorchLevel
+        lastTorchRequest = torchRequest
     }
 
     Box(
@@ -319,7 +585,9 @@ private fun CameraPreviewWithAnalysis(
                 color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f),
                 shape = RoundedCornerShape(28.dp)
             )
-            .onSizeChanged { previewViewport.set(ViewportSize(it.width, it.height)) }
+            .onSizeChanged {
+                captureController.updateViewportSize(ViewportSize(it.width, it.height))
+            }
     ) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
@@ -336,6 +604,11 @@ private fun CameraPreviewWithAnalysis(
                         it.setSurfaceProvider(previewView.surfaceProvider)
                     }
 
+                    val imageCapture = ImageCapture.Builder()
+                        .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                        .setTargetResolution(Size(1280, 720))
+                        .build()
+
                     val analysis = ImageAnalysis.Builder()
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                         .setTargetResolution(Size(1280, 720))
@@ -346,7 +619,7 @@ private fun CameraPreviewWithAnalysis(
                         TargetColorAnalyzer(
                             onColorSampled = onColorSampled,
                             targetFrameSpec = targetFrameSpec,
-                            viewportSizeProvider = { previewViewport.get() }
+                            viewportSizeProvider = captureController::currentViewportSize
                         )
                     )
 
@@ -356,14 +629,19 @@ private fun CameraPreviewWithAnalysis(
                             lifecycleOwner,
                             CameraSelector.DEFAULT_BACK_CAMERA,
                             preview,
+                            imageCapture,
                             analysis
                         )
                         val capability = torchController.inspect(camera)
+                        captureController.bind(imageCapture)
                         boundCamera = camera
                         torchCapability = capability
-                        lastRequestedTorchLevel = null
+                        lastTorchRequest = null
                         onTorchCapabilityChanged(capability)
+                        onCaptureReadyChanged(true)
                     } catch (_: Exception) {
+                        captureController.clearBinding()
+                        onCaptureReadyChanged(false)
                     }
                 }, ContextCompat.getMainExecutor(viewContext))
 
@@ -382,12 +660,22 @@ private fun LightingAssistCard(
     lightingMode: LightingAssistMode,
     onLightingModeChanged: (LightingAssistMode) -> Unit,
     lightingAssistState: LightingAssistState,
+    manualLightingPercent: Int,
+    onManualLightingPercentChanged: (Int) -> Unit,
     torchCapability: TorchCapability,
     permissionGranted: Boolean
 ) {
-    val requestedStrength = if (torchCapability.supportsStrengthControl) {
+    val autoRequestedStrength = if (torchCapability.supportsStrengthControl) {
         AdaptiveLightingPolicy.strengthFor(
-            torchLevel = lightingAssistState.torchTarget,
+            torchLevel = lightingAssistState.autoTorchTarget,
+            maxStrengthLevel = torchCapability.maxStrengthLevel
+        )
+    } else {
+        null
+    }
+    val manualRequestedStrength = if (torchCapability.supportsStrengthControl) {
+        AdaptiveLightingPolicy.manualStrengthForPercent(
+            brightnessPercent = manualLightingPercent,
             maxStrengthLevel = torchCapability.maxStrengthLevel
         )
     } else {
@@ -403,28 +691,38 @@ private fun LightingAssistCard(
         ) {
             Text("Adaptive illumination", style = MaterialTheme.typography.titleMedium)
             Text(
-                "ShadeSync can use the rear torch to stabilize sampling when the guided target frame is too dark.",
+                "ShadeSync can stabilize the guided target frame with automatic torch control or a manually selected brightness level.",
                 style = MaterialTheme.typography.bodySmall
             )
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (lightingMode == LightingAssistMode.OFF) {
                     Button(onClick = { onLightingModeChanged(LightingAssistMode.OFF) }) {
-                        Text("Lighting off")
+                        Text("Off")
                     }
                 } else {
                     OutlinedButton(onClick = { onLightingModeChanged(LightingAssistMode.OFF) }) {
-                        Text("Lighting off")
+                        Text("Off")
                     }
                 }
 
                 if (lightingMode == LightingAssistMode.AUTO) {
                     Button(onClick = { onLightingModeChanged(LightingAssistMode.AUTO) }) {
-                        Text("Auto lighting")
+                        Text("Auto")
                     }
                 } else {
                     OutlinedButton(onClick = { onLightingModeChanged(LightingAssistMode.AUTO) }) {
-                        Text("Auto lighting")
+                        Text("Auto")
+                    }
+                }
+
+                if (lightingMode == LightingAssistMode.MANUAL) {
+                    Button(onClick = { onLightingModeChanged(LightingAssistMode.MANUAL) }) {
+                        Text("Manual")
+                    }
+                } else {
+                    OutlinedButton(onClick = { onLightingModeChanged(LightingAssistMode.MANUAL) }) {
+                        Text("Manual")
                     }
                 }
             }
@@ -436,6 +734,25 @@ private fun LightingAssistCard(
             }
 
             Text(luminanceStatus, style = MaterialTheme.typography.bodySmall)
+
+            if (lightingMode == LightingAssistMode.MANUAL) {
+                Slider(
+                    value = manualLightingPercent.toFloat(),
+                    onValueChange = { onManualLightingPercentChanged(it.toInt().coerceIn(0, 100)) },
+                    valueRange = 0f..100f,
+                    steps = 19
+                )
+
+                val manualStatus = if (torchCapability.supportsStrengthControl && manualRequestedStrength != null) {
+                    "Manual torch intensity: $manualLightingPercent% ($manualRequestedStrength/${torchCapability.maxStrengthLevel})."
+                } else if (manualLightingPercent == 0) {
+                    "Manual torch intensity: 0% (Off)."
+                } else {
+                    "Manual torch intensity: $manualLightingPercent%. Devices without variable-strength flash will switch the torch fully on."
+                }
+
+                Text(manualStatus, style = MaterialTheme.typography.bodySmall)
+            }
 
             val lightingStatus = when {
                 !permissionGranted -> {
@@ -454,11 +771,23 @@ private fun LightingAssistCard(
                     "Torch target: Off."
                 }
 
-                requestedStrength != null -> {
-                    "Torch target: ${lightingAssistState.torchTarget.displayName} ($requestedStrength/${torchCapability.maxStrengthLevel})."
+                lightingMode == LightingAssistMode.MANUAL && manualLightingPercent == 0 -> {
+                    "Torch target: Off."
                 }
 
-                lightingAssistState.torchTarget == TorchLevel.OFF -> {
+                lightingMode == LightingAssistMode.MANUAL && manualRequestedStrength != null -> {
+                    "Torch target: Manual ($manualRequestedStrength/${torchCapability.maxStrengthLevel})."
+                }
+
+                lightingMode == LightingAssistMode.MANUAL -> {
+                    "Torch target: On. This device falls back to binary torch control for manual mode."
+                }
+
+                autoRequestedStrength != null -> {
+                    "Torch target: ${lightingAssistState.autoTorchTarget.displayName} ($autoRequestedStrength/${torchCapability.maxStrengthLevel})."
+                }
+
+                lightingAssistState.autoTorchTarget == TorchLevel.OFF -> {
                     "Torch target: Off."
                 }
 
@@ -477,7 +806,7 @@ private fun BoxScope.ToothTargetOverlay(
     modifier: Modifier = Modifier,
     targetFrameSpec: TargetFrameSpec
 ) {
-    androidx.compose.foundation.Canvas(
+    Canvas(
         modifier = modifier
     ) {
         val frameWidth = size.width * targetFrameSpec.widthFraction
@@ -615,7 +944,7 @@ private class TargetColorAnalyzer(
             image.close()
             return
         }
- 
+
         val yPlane = image.planes[0].buffer
         val uPlane = image.planes[1].buffer
         val vPlane = image.planes[2].buffer
@@ -670,7 +999,11 @@ private class TargetColorAnalyzer(
         }
 
         if (count > 0) {
-            val color = Color.rgb((rSum / count).toInt(), (gSum / count).toInt(), (bSum / count).toInt())
+            val color = Color.rgb(
+                (rSum / count).toInt(),
+                (gSum / count).toInt(),
+                (bSum / count).toInt()
+            )
             lastTimestamp = now
             onColorSampled(color)
         }
@@ -747,7 +1080,10 @@ private fun CalibrationPanel(
             }
 
             Text("Saved calibration entries: ${calibrations.size}/16")
-            LazyColumn(modifier = Modifier.height(160.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            LazyColumn(
+                modifier = Modifier.height(160.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
                 items(VitaShade.entries) { shade ->
                     val savedColor = calibrations[shade]
                     Text(
@@ -765,6 +1101,9 @@ private fun MeasurementPanel(
     liveColor: Int,
     calibrations: Map<VitaShade, Int>
 ) {
+    val liveRgb = liveColor.toRgbColor()
+    val bestMatch = nearestShadeMatch(liveRgb, calibrations)
+
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier
@@ -775,29 +1114,74 @@ private fun MeasurementPanel(
             Text("Real-time shade estimation", style = MaterialTheme.typography.titleMedium)
             if (calibrations.isEmpty()) {
                 Text("No calibration data yet. Please calibrate Vita 16 first.")
+            } else if (bestMatch != null) {
+                Text("Best matched shade: ${bestMatch.shade.code}")
+                Text("RGB distance squared: ${bestMatch.distanceSquared}")
+                Text("Current color: ${liveRgb.toHexString()}")
+                Text("Compared against ${calibrations.size} calibrated shades.")
             } else {
-                val bestMatch = nearestShade(liveColor, calibrations)
-                if (bestMatch != null) {
-                    Text("Best matched shade: ${bestMatch.code}")
-                    Text("Current color: ${liveColor.toRgbColor().toHexString()}")
-                    Text("Compared against ${calibrations.size} calibrated shades.")
-                } else {
-                    Text("Unable to match shade.")
-                }
+                Text("Unable to match shade.")
             }
         }
     }
 }
 
-private fun nearestShade(liveColor: Int, calibrations: Map<VitaShade, Int>): VitaShade? {
-    return RgbDistanceMatcher.nearest(
-        sample = liveColor.toRgbColor(),
-        references = calibrations.mapValues { (_, refColor) -> refColor.toRgbColor() }
+private fun nearestShadeMatch(
+    sample: RgbColor,
+    calibrations: Map<VitaShade, Int>
+): ShadeMatchResult? {
+    if (calibrations.isEmpty()) {
+        return null
+    }
+
+    val references = calibrations.mapValues { (_, refColor) -> refColor.toRgbColor() }
+    val bestShade = RgbDistanceMatcher.nearest(sample, references) ?: return null
+    val bestReference = references[bestShade] ?: return null
+    return ShadeMatchResult(
+        shade = bestShade,
+        distanceSquared = RgbDistanceMatcher.squaredDistance(sample, bestReference)
     )
+}
+
+private fun buildGoogleSignInClient(context: Context) =
+    GoogleSignIn.getClient(
+        context,
+        GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
+            .requestEmail()
+            .requestScopes(
+                Scope(DriveScopes.DRIVE_FILE),
+                Scope(SheetsScopes.SPREADSHEETS)
+            )
+            .build()
+    )
+
+private fun hasRequiredCloudScopes(account: GoogleSignInAccount?): Boolean {
+    return account != null && GoogleSignIn.hasPermissions(
+        account,
+        Scope(DriveScopes.DRIVE_FILE),
+        Scope(SheetsScopes.SPREADSHEETS)
+    )
+}
+
+private fun buildUploadSummary(
+    record: MeasurementUploadRecord,
+    driveWebLink: String
+): String {
+    val shadeText = record.bestMatchShadeCode?.let { " / $it" }.orEmpty()
+    return "Last upload: ${record.capturedAtUnixMs} / ${record.hex}$shadeText / $driveWebLink"
+}
+
+private fun Throwable.asUserMessage(
+    fallback: String
+): String {
+    return localizedMessage?.takeIf { it.isNotBlank() }
+        ?: if (this is ApiException) {
+            "Google services returned status code $statusCode."
+        } else {
+            fallback
+        }
 }
 
 private fun Int.toRgbColor(): RgbColor {
     return RgbColor(Color.red(this), Color.green(this), Color.blue(this))
 }
-
-

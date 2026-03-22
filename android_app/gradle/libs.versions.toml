@@ -9,6 +9,11 @@ activityCompose = "1.8.0"
 kotlin = "2.2.10"
 composeBom = "2024.09.00"
 cameraX = "1.3.4"
+googlePlayServicesAuth = "21.0.0"
+googleApiClient = "2.2.0"
+googleHttpClient = "1.43.3"
+googleDriveService = "v3-rev20220815-2.0.0"
+googleSheetsService = "v4-rev20220927-2.0.0"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -29,6 +34,12 @@ androidx-camera-core = { group = "androidx.camera", name = "camera-core", versio
 androidx-camera-camera2 = { group = "androidx.camera", name = "camera-camera2", version.ref = "cameraX" }
 androidx-camera-lifecycle = { group = "androidx.camera", name = "camera-lifecycle", version.ref = "cameraX" }
 androidx-camera-view = { group = "androidx.camera", name = "camera-view", version.ref = "cameraX" }
+google-play-services-auth = { group = "com.google.android.gms", name = "play-services-auth", version.ref = "googlePlayServicesAuth" }
+google-api-client-android = { group = "com.google.api-client", name = "google-api-client-android", version.ref = "googleApiClient" }
+google-api-client-gson = { group = "com.google.api-client", name = "google-api-client-gson", version.ref = "googleApiClient" }
+google-http-client-android = { group = "com.google.http-client", name = "google-http-client-android", version.ref = "googleHttpClient" }
+google-api-drive-service = { group = "com.google.apis", name = "google-api-services-drive", version.ref = "googleDriveService" }
+google-api-sheets-service = { group = "com.google.apis", name = "google-api-services-sheets", version.ref = "googleSheetsService" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
